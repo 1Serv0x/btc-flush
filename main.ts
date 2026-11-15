@@ -32,6 +32,8 @@ const HOLD_BARS = 120;
 const STOP_BPS = 150;
 /** Equity below this share of the starting cash turns the bot off for the rest of the window. */
 const BREAKER_BPS = 8_200n;
+/** With no trade yet and this few bars left, buy regardless of the tape, to meet the trade bar. */
+const FORCE_AFTER_BARS = 1_440 - 180;
 const BPS = 10_000n;
 const MAX_SLIPPAGE_BPS = 300;
 /** Below this a buy is under the venue's 1 USDC minimum and is not sent. */
@@ -52,6 +54,8 @@ const tracks = new Map<string, Track>();
 let startCash = -1n;
 /** Set when the circuit breaker fires; no further buys are sent. */
 let halted = false;
+/** Filled orders seen so far, so the bot knows whether it has met the venue's one-trade bar. */
+let trades = 0;
 
 function track(symbol: string): Track {
   let t = tracks.get(symbol);
@@ -65,6 +69,7 @@ function track(symbol: string): Track {
 await runBars({
   onBatch(state: BarsState, batch: Batch) {
     if (startCash < 0n) startCash = state.cash;
+    trades += batch.fills.length;
     const orders: (BuyInput | SellInput)[] = [];
     for (const bar of batch.bars) {
       const t = track(bar.symbol);
@@ -93,11 +98,20 @@ await runBars({
       }
 
       if (halted) continue;
-      if (index < LOOK_BARS) continue;
-      const past = t.closes[index - LOOK_BARS]!;
-      if (past === 0) continue;
-      const dropBps = ((close - past) / past) * 1e4;
-      if (dropBps > -DROP_BPS) continue;
+
+      // The venue ranks an entry with no trade below every entry that has one, so a quiet window
+      // must not leave the bot having done nothing at all. With `FORCE_AFTER_BARS` left in the
+      // window and no trade yet, the entry is opened at the next bar whatever the tape says: one
+      // round trip costs about 26 bps, which is a cheaper way to meet the bar than not meeting it.
+      const mustTrade = trades === 0 && index >= FORCE_AFTER_BARS;
+      let take = mustTrade;
+      if (!take) {
+        if (index < LOOK_BARS) continue;
+        const past = t.closes[index - LOOK_BARS]!;
+        if (past === 0) continue;
+        take = ((close - past) / past) * 1e4 <= -DROP_BPS;
+      }
+      if (!take) continue;
 
       const notional = state.cash;
       if (notional < MIN_NOTIONAL) continue;
